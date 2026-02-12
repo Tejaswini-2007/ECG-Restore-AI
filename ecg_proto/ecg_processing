@@ -1,0 +1,101 @@
+import io
+from typing import Dict, Tuple
+
+import cv2
+import numpy as np
+from PIL import Image
+
+
+def load_image_from_bytes(data: bytes) -> np.ndarray:
+    """
+    Load an image from raw bytes into a BGR numpy array suitable for OpenCV.
+    """
+    image = Image.open(io.BytesIO(data)).convert("RGB")
+    arr = np.array(image)
+    # Convert RGB (Pillow) to BGR (OpenCV convention)
+    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    return bgr
+
+
+def extract_waveform(
+    image_bgr: np.ndarray,
+    duration_seconds: float = 10.0,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
+    """
+    Extract an approximate 1D ECG waveform from an ECG image.
+
+    Assumptions:
+    - Single ECG trace on a light background.
+    - The trace occupies most of the image height.
+    - The full image width corresponds to `duration_seconds` of signal.
+
+    Returns
+    -------
+    time : np.ndarray
+        Time axis in seconds.
+    amplitude : np.ndarray
+        Normalized amplitude in [-1, 1].
+    debug : dict
+        Dictionary containing intermediate images for visualization.
+    """
+    if image_bgr is None or image_bgr.size == 0:
+        raise ValueError("Empty image provided.")
+
+    # Convert to grayscale
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Slight blur to reduce noise
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Adaptive thresholding / Otsu for robust binarization
+    # We invert so that the trace (typically dark) becomes white (255)
+    _, binary = cv2.threshold(
+        blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+
+    # Optional morphology to clean small dots and connect line segments
+    kernel = np.ones((3, 3), np.uint8)
+    cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    height, width = cleaned.shape
+
+    # For each column, find the vertical "center of mass" of white pixels
+    ys = np.full(width, np.nan, dtype=float)
+    for x in range(width):
+        column = cleaned[:, x]
+        indices = np.flatnonzero(column > 0)
+        if indices.size > 0:
+            ys[x] = float(indices.mean())
+
+    # Interpolate gaps where the line was not detected
+    nans = np.isnan(ys)
+    if np.all(nans):
+        raise RuntimeError(
+            "Failed to detect any ECG trace pixels. "
+            "Try a cleaner image or adjust preprocessing."
+        )
+
+    if np.any(nans):
+        valid = ~nans
+        ys[nans] = np.interp(np.flatnonzero(nans), np.flatnonzero(valid), ys[valid])
+
+    # Convert vertical position to amplitude: invert y, remove DC, normalize to [-1, 1]
+    # Top of image = high amplitude, bottom = low amplitude
+    y_inverted = height - ys
+    y_centered = y_inverted - np.mean(y_inverted)
+    max_abs = np.max(np.abs(y_centered))
+    if max_abs == 0:
+        amplitude = np.zeros_like(y_centered)
+    else:
+        amplitude = y_centered / max_abs
+
+    # Construct time axis assuming uniform sampling across the width
+    time = np.linspace(0.0, duration_seconds, num=width, endpoint=False)
+
+    debug = {
+        "gray": gray,
+        "binary": binary,
+        "cleaned": cleaned,
+    }
+    return time, amplitude, debug
+
